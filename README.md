@@ -4,7 +4,7 @@
 
 <h1 align="center">MiniStack</h1>
 <p align="center"><strong>Free, open-source local AWS emulator. Free forever.</strong></p>
-<p align="center">40+ AWS services on a single port · Terraform compatible · Real databases · MIT licensed</p>
+<p align="center">55+ AWS services on a single port · Terraform compatible · Real databases · MIT licensed</p>
 
 <p align="center">
   <a href="https://github.com/ministackorg/ministack/releases"><img src="https://img.shields.io/github/v/release/ministackorg/ministack" alt="GitHub release"></a>
