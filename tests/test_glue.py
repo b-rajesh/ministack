@@ -123,6 +123,36 @@ def test_glue_table_v2(glue):
         glue.get_table(DatabaseName="glue_tbl_v2db", Name="tbl_v2")
     assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
 
+def test_glue_view_original_text_roundtrip(glue):
+    glue.create_database(DatabaseInput={"Name": "glue_view_db"})
+    original = "/* Presto View: eyJjYXRhbG9nIjoiaWNlYmVyZyJ9 */"
+    expanded = "/* Presto View */"
+    glue.create_table(
+        DatabaseName="glue_view_db",
+        TableInput={
+            "Name": "vw_x",
+            "TableType": "VIRTUAL_VIEW",
+            "ViewOriginalText": original,
+            "ViewExpandedText": expanded,
+        },
+    )
+    resp = glue.get_table(DatabaseName="glue_view_db", Name="vw_x")
+    assert resp["Table"]["ViewOriginalText"] == original
+    assert resp["Table"]["ViewExpandedText"] == expanded
+
+    glue.update_table(
+        DatabaseName="glue_view_db",
+        TableInput={
+            "Name": "vw_x",
+            "TableType": "VIRTUAL_VIEW",
+            "ViewOriginalText": original + " v2",
+            "ViewExpandedText": expanded + " v2",
+        },
+    )
+    resp2 = glue.get_table(DatabaseName="glue_view_db", Name="vw_x")
+    assert resp2["Table"]["ViewOriginalText"] == original + " v2"
+    assert resp2["Table"]["ViewExpandedText"] == expanded + " v2"
+
 def test_glue_list_v2(glue):
     glue.create_database(DatabaseInput={"Name": "glue_lst_v2db"})
     glue.create_table(
@@ -909,3 +939,38 @@ def test_glue_partition_indexes(glue):
     # cleanup
     glue.delete_table(DatabaseName=db, Name=tbl)
     glue.delete_database(Name=db)
+
+
+# ── Spark job image selection (1.3.50) ─────────────────────
+
+def test_glue_spark_image_for_version_maps_to_official_aws_image():
+    """`GlueVersion: 4.0` and `3.0` map to the canonical `amazon/aws-glue-libs`
+    images real AWS Glue uses for Spark. Override via `GLUE_DOCKER_IMAGE`."""
+    from ministack.services import glue as _glue
+
+    # Default mapping for supported Spark Glue versions
+    assert _glue._glue_image_for_version("4.0") == "amazon/aws-glue-libs:glue_libs_4.0.0_image_01"
+    assert _glue._glue_image_for_version("3.0") == "amazon/aws-glue-libs:glue_libs_3.0.0_image_01"
+
+    # Unknown GlueVersion falls back to 4.0 (latest supported)
+    assert _glue._glue_image_for_version("99.0") == "amazon/aws-glue-libs:glue_libs_4.0.0_image_01"
+
+
+def test_glue_spark_image_env_override(monkeypatch):
+    """Setting GLUE_DOCKER_IMAGE bypasses the per-version map."""
+    from ministack.services import glue as _glue
+
+    monkeypatch.setattr(_glue, "GLUE_DOCKER_IMAGE_OVERRIDE", "my-org/custom-glue:latest")
+    assert _glue._glue_image_for_version("4.0") == "my-org/custom-glue:latest"
+    assert _glue._glue_image_for_version("3.0") == "my-org/custom-glue:latest"
+
+
+def test_glue_is_spark_job_classifies_by_command_name():
+    """`glueetl` and `gluestreaming` are Spark; `pythonshell` is not."""
+    from ministack.services import glue as _glue
+
+    assert _glue._is_spark_job({"Command": {"Name": "glueetl"}}) is True
+    assert _glue._is_spark_job({"Command": {"Name": "gluestreaming"}}) is True
+    assert _glue._is_spark_job({"Command": {"Name": "pythonshell"}}) is False
+    assert _glue._is_spark_job({"Command": {}}) is False
+    assert _glue._is_spark_job({}) is False

@@ -7,10 +7,33 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [1.3.49] — 2026-05-24
+## [1.3.50] — 2026-05-26
 
 ### Added
-- **Amazon Inspector2** — new service emulator with 14 API operations: `Enable`, `Disable`, `ListFindings` (with filtering, sorting, pagination), `BatchGetFindingDetails`, `ListCoverage`, `ListCoverageStatistics`, `ListFindingAggregations`, `SearchVulnerabilities`, `TagResource`, `UntagResource`, `ListTagsForResource`, `CreateFilter`, `ListFilters`, `DeleteFilter`. Generates deterministic stub vulnerability findings for ECR container images, Lambda functions, and EC2 instances when enabled.
+- **S3 Tables (`s3tables`)** — new service emulator for the AWS S3 Tables API: table buckets, namespaces, and Iceberg-format tables. Control plane covers `CreateTableBucket`, `ListTableBuckets`, `GetTableBucket`, `DeleteTableBucket`, `CreateNamespace`, `ListNamespaces`, `GetNamespace`, `DeleteNamespace`, `CreateTable`, `ListTables`, `GetTable`, `DeleteTable`, `GetTableMetadataLocation`, `UpdateTableMetadataLocation`. Ships with an embedded **Iceberg REST catalog** at `/iceberg` so Spark jobs configured with `spark.sql.catalog.*.type=rest` and `spark.sql.catalog.*.uri=http://<ministack>/iceberg` can create, load, and commit Iceberg tables without an external catalog server. Data files land in MiniStack's S3 service; table metadata (schemas, snapshots, manifests) lives in memory.
+- **Glue Spark jobs run on the official `amazon/aws-glue-libs` PySpark image** — `GlueVersion: 4.0` and `3.0` map to their canonical AWS Glue images (`glue_libs_4.0.0_image_01` / `glue_libs_3.0.0_image_01`); override the image via `GLUE_DOCKER_IMAGE`. Job containers run on MiniStack's Docker network so they reach S3, RDS, and other ministack services by container hostname.
+- **IAM `UpdateAccessKey`** — enables toggling an access key between `Active` and `Inactive`, matching the two statuses the real AWS API accepts. Optional `UserName` is validated when provided. Contributed by @lahmish.
+- **IAM `GetAccessKeyLastUsed`** — returns the AWS "never used" shape (`Region`/`ServiceName` = `N/A`, no `LastUsedDate`) since MiniStack does not track per-key usage history. Contributed by @lahmish.
+
+### Fixed
+- **Lambda invocation log includes user output alongside the traceback on error** — when a handler raised after printing, the response log dropped the user output and only returned the traceback. Both are now returned, newline-separated, matching real Lambda CloudWatch Logs output. Contributed by @Baptiste-Garcin.
+- **EC2 `CreateVpcEndpoint` and `CreateFlowLogs` now persist `TagSpecifications`** — tags passed at creation time were silently dropped. Tags are now stored, returned by `DescribeFlowLogs`, and cleaned up on `DeleteFlowLogs`. The `fl-` prefix is also registered in the resource-type guesser so flow-log IDs are correctly resolved by the Resource Groups Tagging API. Contributed by @lahmish.
+
+---
+
+## [1.3.49] — 2026-05-25
+
+### Added
+- **Amazon Inspector2** — new service emulator with 14 API operations: `Enable`, `Disable`, `ListFindings` (with filtering, sorting, pagination), `BatchGetFindingDetails`, `ListCoverage`, `ListCoverageStatistics`, `ListFindingAggregations`, `SearchVulnerabilities`, `TagResource`, `UntagResource`, `ListTagsForResource`, `CreateFilter`, `ListFilters`, `DeleteFilter`. Generates deterministic stub vulnerability findings for ECR container images, Lambda functions, and EC2 instances when enabled. Contributed by @ry-allan.
+- **RDS auto-respawn at boot** — when `PERSIST_STATE=1` and an `rds.json` state file exists, MiniStack now eager-imports the RDS module at startup and respawns the Docker container for every persisted instance immediately, with no client API call required. Previously the module loaded lazily on the first RDS request, leaving the postgres/mysql container down until the user happened to call an `awslocal rds` operation. Zero idle cost when no RDS state file is present (the conditional skips the import entirely). Reported by @doodaz.
+- **Glue `CreateTable` persists `ViewOriginalText` / `ViewExpandedText`** — views created via `CreateTable` (the path used by Trino, Spark, and Athena) lost their SQL body because `_create_table` ignored both fields. `GetTable` now returns them, unblocking Trino's iceberg connector and other engines that fail with `viewOriginalText must be present`. Contributed by @yonatoasis.
+- **Glue `CreateTable` / `UpdateTable` persist `ViewDefinition` and `IsMultiDialectView`** — newer multi-dialect view clients (Spark 3.4+, Glue 4.0 jobs, Lake Formation cross-engine views) round-trip the full view definition instead of seeing it silently dropped on create.
+
+### Fixed
+- **AppSync Events resources persist across restarts with `PERSIST_STATE=1`** — Event APIs, channel namespaces, and API keys created against the AppSync Events endpoint (`/v2/apis`) were silently dropped on container restart because `appsync_events.json` was never written at shutdown. State is now saved and restored on every restart, matching the behavior of every other persisted service. Same fix covers a related class of restart drops for `apigateway_v1` on first boot and for services reached only via inter-service calls (Lambda-auto-created CloudWatch log groups, EventBridge targets fired by S3 notifications). Reported by @yaegassy.
+- **RDS respawn after restart no longer fails with `port is already allocated`** — restored DB instances tried to bind the engine's standard port (5432 for postgres, 3306 for mysql) on the host instead of the original docker host port, so every restart with persisted state left the instance in `failed`. The host port is now tracked separately on the instance, validated as free before reuse, and falls back to a fresh free port if something else has taken it. Stale `Created`-status containers from prior failed boots are force-removed before respawn so they don't hold the binding. Reported by @doodaz.
+- **CloudFront `ListDistributions` round-trips origin configuration** — `DistributionSummary` now includes `Origins` and `DefaultCacheBehavior` from the stored distribution config, so custom origins round-trip consistently across create, get, list, and update flows. Contributed by @CoffeeRaptor.
+- **CloudFront `DistributionSummary` emits all AWS-required fields** — `Aliases`, `CacheBehaviors`, `CustomErrorResponses`, `PriceClass`, `ViewerCertificate`, `Restrictions`, `WebACLId`, `HttpVersion`, `IsIPV6Enabled`, and `Staging` are now emitted alongside the fields above. When a field wasn't set on the original `CreateDistributionConfig`, ministack emits a minimal-but-valid default (empty `Quantity=0` containers, `CloudFrontDefaultCertificate=true`, `HttpVersion=http2`) so strict-parsing SDKs (Go v2, Java v2) don't reject the response.
 
 ---
 
@@ -20,7 +43,6 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **S3 `GetObjectAcl` and `PutObjectAcl`** — both `?acl` subresource operations are now implemented. `GetObjectAcl` returns the stored policy or, if none has been set, the AWS default of a single `FULL_CONTROL` Grant to the request's account-id owner. `PutObjectAcl` accepts either a canned ACL via the `x-amz-acl` header (`private`, `public-read`, `public-read-write`, `authenticated-read`, `aws-exec-read`, `bucket-owner-read`, `bucket-owner-full-control`) or a full `<AccessControlPolicy>` XML body; invalid canned values return `InvalidArgument` and malformed bodies return `MalformedACLError`. As with retention, legal-hold and bucket policies, the policy is stored and round-tripped but not enforced on the data plane. `NoSuchKey` returned for missing keys, matching the only error modeled in botocore. Reported by @smpial.
 
 ### Fixed
-- **CloudFront distribution origin configuration** — `ListDistributions` now includes origin configuration from the stored distribution config, so custom origins round-trip consistently across create, get, list, and update flows.
 - **RDS persistence-restore module-import race** — the v1.3.47 restore-respawn threads called `_get_docker()` which was defined further down in the same module, so a thread reaching the lookup before the parser finished raised `NameError: name '_get_docker' is not defined` and stranded the restored instance in `creating`. The `load_state("rds")` block now runs at the bottom of the module, after every helper the restore threads can touch. Reported by @doodaz.
 
 ---
