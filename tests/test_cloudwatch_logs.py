@@ -6,8 +6,27 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
+
+_endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+
+def _regional_client(service: str, region: str):
+    return boto3.client(
+        service,
+        endpoint_url=_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(
+            region_name=region,
+            retries={"mode": "standard"},
+            max_pool_connections=50,
+        ),
+    )
 
 
 def test_logs_put_get(logs):
@@ -215,6 +234,44 @@ def test_logs_metric_filter(logs):
     logs.delete_metric_filter(logGroupName=group, filterName="error-count")
     resp2 = logs.describe_metric_filters(logGroupName=group)
     assert not any(f["filterName"] == "error-count" for f in resp2.get("metricFilters", []))
+
+
+def test_logs_metric_filters_are_region_scoped():
+    group = f"/intg/metricfilter-region/{_uuid_mod.uuid4().hex[:8]}"
+    east = _regional_client("logs", "us-east-1")
+    west = _regional_client("logs", "us-west-2")
+
+    east.create_log_group(logGroupName=group)
+    west.create_log_group(logGroupName=group)
+    east.put_metric_filter(
+        logGroupName=group,
+        filterName="error-count",
+        filterPattern="ERROR",
+        metricTransformations=[{
+            "metricName": "EastErrors",
+            "metricNamespace": "MyApp",
+            "metricValue": "1",
+        }],
+    )
+    west.put_metric_filter(
+        logGroupName=group,
+        filterName="error-count",
+        filterPattern="WARN",
+        metricTransformations=[{
+            "metricName": "WestWarnings",
+            "metricNamespace": "MyApp",
+            "metricValue": "1",
+        }],
+    )
+
+    east_filters = east.describe_metric_filters(logGroupName=group)["metricFilters"]
+    west_filters = west.describe_metric_filters(logGroupName=group)["metricFilters"]
+
+    assert [f["filterPattern"] for f in east_filters] == ["ERROR"]
+    assert [f["filterPattern"] for f in west_filters] == ["WARN"]
+    assert east.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["metricFilterCount"] == 1
+    assert west.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["metricFilterCount"] == 1
+
 
 def test_logs_tag_log_group(logs):
     import uuid as _uuid
@@ -799,9 +856,55 @@ def test_metric_filters_survive_warm_boot():
     assert ("/aws/lambda/foo", "ErrorCount") in mod._metric_filters, (
         "Metric filter lost across get_state → restore_state — "
         "_metric_filters must be in both. Tuple keys are round-tripped "
-        "by AccountScopedDict's JSON encoder hook."
+        "by AccountRegionScopedDict's JSON encoder hook."
     )
     mod.reset()
+
+
+def test_legacy_metric_filters_restore_to_log_group_region():
+    from ministack.core.responses import AccountScopedDict, get_region, set_request_region
+
+    mod = _module()
+    mod.reset()
+    group = f"/aws/lambda/legacy-filter-{_uuid_mod.uuid4().hex[:8]}"
+    original_region = get_region()
+
+    legacy_metric_filters = AccountScopedDict()
+    legacy_metric_filters[(group, "ErrorCount")] = {
+        "filterName": "ErrorCount",
+        "logGroupName": group,
+        "filterPattern": "ERROR",
+        "metricTransformations": [{
+            "metricName": "Errors",
+            "metricNamespace": "Lambda",
+            "metricValue": "1",
+        }],
+        "creationTime": 1700000000000,
+    }
+
+    try:
+        set_request_region("us-east-1")
+        mod.restore_state({
+            "log_groups": {
+                group: {
+                    "arn": f"arn:aws:logs:us-west-2:000000000000:log-group:{group}:*",
+                    "creationTime": 1700000000000,
+                    "retentionInDays": None,
+                    "tags": {},
+                    "subscriptionFilters": {},
+                    "streams": {},
+                },
+            },
+            "metric_filters": legacy_metric_filters,
+        })
+
+        set_request_region("us-west-2")
+        assert (group, "ErrorCount") in mod._metric_filters
+        set_request_region("us-east-1")
+        assert (group, "ErrorCount") not in mod._metric_filters
+    finally:
+        set_request_region(original_region)
+        mod.reset()
 
 
 # ── _queries ───────────────────────────────────────────────────────────
