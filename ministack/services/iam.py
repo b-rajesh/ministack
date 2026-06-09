@@ -57,6 +57,7 @@ _groups = AccountScopedDict()
 _user_inline_policies = AccountScopedDict()
 _oidc_providers = AccountScopedDict()
 _service_linked_role_deletion_tasks = AccountScopedDict()
+_sla_jobs = AccountScopedDict()
 _saml_providers = AccountScopedDict()
 _mfa_devices = AccountScopedDict()
 _login_profiles = AccountScopedDict()
@@ -286,6 +287,7 @@ def get_state():
         "service_linked_role_deletion_tasks": copy.deepcopy(_service_linked_role_deletion_tasks),
         "user_inline_policies": copy.deepcopy(_user_inline_policies),
         "aws_managed_attachment_counts": copy.deepcopy(_aws_managed_attachment_counts),
+        "sla_jobs": copy.deepcopy(_sla_jobs),
         "saml_providers": copy.deepcopy(_saml_providers),
         "mfa_devices": copy.deepcopy(_mfa_devices),
         "login_profiles": copy.deepcopy(_login_profiles),
@@ -304,6 +306,7 @@ def restore_state(data):
         _service_linked_role_deletion_tasks.update(data.get("service_linked_role_deletion_tasks", {}))
         _user_inline_policies.update(data.get("user_inline_policies", {}))
         _aws_managed_attachment_counts.update(data.get("aws_managed_attachment_counts", {}))
+        _sla_jobs.update(data.get("sla_jobs", {}))
         _saml_providers.update(data.get("saml_providers", {}))
         _mfa_devices.update(data.get("mfa_devices", {}))
         _login_profiles.update(data.get("login_profiles", {}))
@@ -1977,6 +1980,37 @@ def _delete_oidc_provider(p):
     return _xml(200, "DeleteOpenIDConnectProviderResponse", "", ns="iam")
 
 
+# -------------------- Service last accessed (Access Advisor) --------------------
+
+
+def _generate_service_last_accessed_details(p):
+    arn = _p(p, "Arn")
+    job_id = new_uuid()
+    _sla_jobs[job_id] = {"Arn": arn, "JobStatus": "COMPLETED", "JobCreationDate": _now()}
+    return _xml(200, "GenerateServiceLastAccessedDetailsResponse",
+                f"<GenerateServiceLastAccessedDetailsResult>"
+                f"<JobId>{job_id}</JobId>"
+                f"</GenerateServiceLastAccessedDetailsResult>",
+                ns="iam")
+
+
+def _get_service_last_accessed_details(p):
+    job_id = _p(p, "JobId")
+    job = _sla_jobs.get(job_id)
+    if not job:
+        return _error(404, "NoSuchEntity",
+                      f"Job {job_id} not found.", ns="iam")
+    return _xml(200, "GetServiceLastAccessedDetailsResponse",
+                f"<GetServiceLastAccessedDetailsResult>"
+                f"<JobStatus>{job['JobStatus']}</JobStatus>"
+                f"<JobCreationDate>{job['JobCreationDate']}</JobCreationDate>"
+                f"<JobCompletionDate>{job['JobCreationDate']}</JobCompletionDate>"
+                f"<ServicesLastAccessed></ServicesLastAccessed>"
+                f"<IsTruncated>false</IsTruncated>"
+                f"</GetServiceLastAccessedDetailsResult>",
+                ns="iam")
+
+
 def _list_oidc_providers(p):
     members = "".join(
         f"<member><Arn>{arn}</Arn></member>"
@@ -2385,6 +2419,8 @@ _IAM_HANDLERS = {
     "CreateOpenIDConnectProvider": _create_oidc_provider,
     "GetOpenIDConnectProvider": _get_oidc_provider,
     "DeleteOpenIDConnectProvider": _delete_oidc_provider,
+    "GenerateServiceLastAccessedDetails": _generate_service_last_accessed_details,
+    "GetServiceLastAccessedDetails": _get_service_last_accessed_details,
     "CreateSAMLProvider": _create_saml_provider,
     "GetSAMLProvider": _get_saml_provider,
     "ListSAMLProviders": _list_saml_providers,
@@ -2419,6 +2455,7 @@ def reset():
     _user_inline_policies.clear()
     _oidc_providers.clear()
     _service_linked_role_deletion_tasks.clear()
+    _sla_jobs.clear()
     _saml_providers.clear()
     _mfa_devices.clear()
     _login_profiles.clear()
