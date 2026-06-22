@@ -872,3 +872,131 @@ def test_eks_k3s_run_kwargs_appends_node_labels():
     # Existing server flags must still be present — refactor must not regress them.
     assert "server" in run_kwargs["command"]
     assert "--https-listen-port=6443" in run_kwargs["command"]
+
+
+# ---------------------------------------------------------------------------
+# DescribeCluster endpoint resolution (reachable from inside the cluster network)
+# ---------------------------------------------------------------------------
+
+class _FakeContainer:
+    def __init__(self, ip, network):
+        self._ip = ip
+        self._network = network
+
+    def reload(self):
+        pass
+
+    @property
+    def attrs(self):
+        return {"NetworkSettings": {"Networks": {self._network: {"IPAddress": self._ip}}}}
+
+
+class _FakeClient:
+    def __init__(self, container):
+        self._container = container
+
+    class _Containers:
+        def __init__(self, container):
+            self._container = container
+
+        def get(self, _id):
+            return self._container
+
+    @property
+    def containers(self):
+        return self._Containers(self._container)
+
+
+def test_eks_resolve_cluster_endpoint_prefers_container_ip(monkeypatch):
+    """On the ministack Docker network, the endpoint must be the container's IP on
+    :6443 — that is the address an in-cluster controller (Karpenter) can reach."""
+    from ministack.services import eks as eks_mod
+
+    monkeypatch.setattr(eks_mod, "_wait_for_port", lambda host, port, timeout=30: True)
+    client = _FakeClient(_FakeContainer("172.18.0.7", "ministack-net"))
+    cluster = {"name": "c", "_port": 16443, "_docker_id": "abc"}
+
+    ep = eks_mod._resolve_cluster_endpoint(client, cluster, "ministack-net")
+    assert ep == "https://172.18.0.7:6443"
+
+
+def test_eks_resolve_cluster_endpoint_falls_back_to_localhost(monkeypatch):
+    """No network / no container → stable host form https://localhost:{port}."""
+    from ministack.services import eks as eks_mod
+
+    monkeypatch.setattr(eks_mod, "_wait_for_port", lambda host, port, timeout=30: True)
+    cluster = {"name": "c", "_port": 16443, "_docker_id": None}
+
+    ep = eks_mod._resolve_cluster_endpoint(None, cluster, None)
+    assert ep == "https://localhost:16443"
+
+
+def test_eks_resolve_cluster_endpoint_unreachable_container_ip_uses_localhost(monkeypatch):
+    """A container IP that never opens :6443 must not be returned — fall back to
+    localhost so DescribeCluster never advertises a dead container address."""
+    from ministack.services import eks as eks_mod
+
+    # Container IP unreachable; only localhost answers.
+    monkeypatch.setattr(eks_mod, "_wait_for_port", lambda host, port, timeout=30: host == "127.0.0.1")
+    client = _FakeClient(_FakeContainer("172.18.0.7", "net"))
+    cluster = {"name": "c", "_port": 16443, "_docker_id": "abc"}
+
+    ep = eks_mod._resolve_cluster_endpoint(client, cluster, "net")
+    assert ep == "https://localhost:16443"
+
+
+def test_eks_resolve_cluster_endpoint_no_probe_skips_wait(monkeypatch):
+    """probe=False (the failure path) must NOT call _wait_for_port — a failed
+    container's port never opens, so probing would block the background thread for
+    the full timeout (regression: this starved the event loop under create churn)."""
+    from ministack.services import eks as eks_mod
+
+    def _boom(*a, **k):
+        raise AssertionError("_wait_for_port must not be called when probe=False")
+
+    monkeypatch.setattr(eks_mod, "_wait_for_port", _boom)
+    cluster = {"name": "c", "_port": 16443, "_docker_id": None}
+
+    ep = eks_mod._resolve_cluster_endpoint(None, cluster, None, probe=False)
+    assert ep == "https://localhost:16443"
+
+
+def test_eks_resolve_cluster_endpoint_honours_ministack_host(monkeypatch):
+    """The host-side fallback uses MINISTACK_HOST so a remote-host deployment reports
+    a reachable endpoint — consistent with the OIDC issuer URL, not hardcoded localhost."""
+    from ministack.services import eks as eks_mod
+
+    monkeypatch.setattr(eks_mod, "_MINISTACK_HOST", "10.0.0.5")
+    monkeypatch.setattr(eks_mod, "_wait_for_port", lambda host, port, timeout=30: True)
+    cluster = {"name": "c", "_port": 16443, "_docker_id": None}
+
+    ep = eks_mod._resolve_cluster_endpoint(None, cluster, None)
+    assert ep == "https://10.0.0.5:16443"
+
+
+def test_eks_restore_state_normalizes_endpoint_to_localhost():
+    """A persisted cluster restores with no running container, so its endpoint is
+    normalized to the stable https://localhost:{port} form (not a dead container
+    IP, and never empty — it is still reported ACTIVE)."""
+    from ministack.services import eks as eks_mod
+
+    eks_mod.reset()
+    try:
+        eks_mod._clusters["c-restore"] = {
+            "name": "c-restore",
+            "status": "ACTIVE",
+            "_port": 16443,
+            "endpoint": "https://172.18.0.9:6443",  # stale container IP from prev run
+            "_docker_id": "deadbeef",
+        }
+        state = eks_mod.get_state()
+        eks_mod.reset()
+
+        eks_mod.restore_state(state)
+
+        restored = eks_mod._clusters.get("c-restore")
+        assert restored["endpoint"] == "https://localhost:16443"
+        assert restored["_docker_id"] is None
+        assert restored["status"] == "ACTIVE"  # endpoint stays non-empty for ACTIVE
+    finally:
+        eks_mod.reset()

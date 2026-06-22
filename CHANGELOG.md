@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **EKS — `DescribeCluster` endpoint resolves from inside the cluster network on every path** — the failure-fallback paths in cluster creation and OIDC-config restart hardcoded `https://localhost:{port}`, which is reachable from the ministack host but **not** from inside the nested k3s container. An in-cluster controller (e.g. Karpenter) reading `cluster.endpoint` could not reach the kube-apiserver and required a `--cluster-endpoint=https://kubernetes.default.svc` override. Endpoint resolution is now a single helper (`_resolve_cluster_endpoint`) used by both the create and OIDC-restart background paths — on success **and** on failure — that prefers the k3s container's IP on the ministack Docker network (`https://{ip}:6443`) and falls back to the host-published `https://{host}:{port}` (`MINISTACK_HOST`, default `localhost`) only when no container IP is reachable — consistent with the OIDC issuer URL, so a remote-host deployment reports a reachable endpoint instead of a hardcoded `localhost`. Restored clusters (persistence) normalize their endpoint to the same stable host form instead of carrying over a dead container IP, keeping the `ACTIVE`-cluster shape consistent for `aws eks update-kubeconfig` and Terraform. Contributed by @b-rajesh.
+
+---
+
 ## [1.3.66] — 2026-06-22
 
 ### Added

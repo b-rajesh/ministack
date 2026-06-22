@@ -153,14 +153,22 @@ def restore_state(data):
     _idp_configs.update(data.get("idp_configs", {}))
     if "port_counter" in data:
         _port_counter[0] = data["port_counter"]
-    # Restored clusters have no running k3s container — keep ACTIVE with mock endpoint
-    if isinstance(_clusters, AccountScopedDict):
-        for key in list(_clusters._data):
-            c = _clusters._data[key]
-            c["_docker_id"] = None
-    else:
-        for c in _clusters.values():
-            c["_docker_id"] = None
+    # Restored clusters have no running k3s container. Drop the stale docker id and
+    # normalize the endpoint to the stable host form (https://{MINISTACK_HOST}:{port},
+    # default localhost). The cluster is still reported ACTIVE, so the endpoint must
+    # stay non-empty: an ACTIVE cluster with an empty endpoint is a contradictory
+    # shape that breaks `aws eks update-kubeconfig` and Terraform drift detection.
+    # Any container IP persisted from the previous run is now dead, so the configured
+    # ministack host is the only address worth reporting after a restart.
+    # to_dict() yields every account's live record dict so the rewrite is applied
+    # across all tenants — the account-scoped views (values()/items()) would see
+    # only the default account because no request scope is set at import time.
+    clusters = _clusters.to_dict().values() if isinstance(_clusters, AccountScopedDict) else _clusters.values()
+    for c in clusters:
+        c["_docker_id"] = None
+        port = c.get("_port")
+        if port:
+            c["endpoint"] = f"https://{_MINISTACK_HOST}:{port}"
 
 
 
@@ -258,6 +266,61 @@ def _wait_for_port(host, port, timeout=30):
         except (OSError, ConnectionRefusedError):
             time.sleep(0.5)
     return False
+
+
+def _resolve_cluster_endpoint(client, cluster, ms_network, probe=True):
+    """Resolve the kube-apiserver endpoint for a cluster.
+
+    Prefers an address reachable from *inside* the ministack Docker network (the
+    k3s container's IP on that network) so in-cluster controllers — e.g.
+    Karpenter — can reach the API server through the value DescribeCluster
+    returns, with no ``--cluster-endpoint`` override. Falls back to the
+    host-published ``https://{MINISTACK_HOST}:{port}`` (``MINISTACK_HOST`` defaults
+    to ``localhost``).
+
+    The host endpoint is reachable from wherever ministack is published — the local
+    host, or the address in ``MINISTACK_HOST`` when set — but NOT from inside the
+    k3s container network; it is the last-resort default used only when no container
+    IP is available.
+
+    ``probe`` controls the readiness wait: on the success path (k3s is booting)
+    we wait for the port to open (``_wait_for_port``) before committing to an
+    address. On the *failure* path the container did not come up, so probing a
+    port that will never open just blocks the calling thread for the full
+    ``_wait_for_port`` timeout — pass ``probe=False`` there to return the
+    best-effort endpoint immediately instead of blocking.
+
+    Pure helper: the caller pre-resolves ``client`` and ``ms_network`` in the
+    request/thread context, so this never reads contextvars (``get_account_id`` /
+    ``get_region``) or ``AccountScopedDict``. Those do not propagate into a
+    background thread, so resolving them here would silently use the wrong tenant.
+    """
+    name = cluster.get("name", "?")
+    port = cluster.get("_port")
+    docker_id = cluster.get("_docker_id")
+    if client and ms_network and docker_id:
+        try:
+            container = client.containers.get(docker_id)
+            container.reload()
+            networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+            container_ip = networks.get(ms_network, {}).get("IPAddress", "")
+            if container_ip and (not probe or _wait_for_port(container_ip, 6443)):
+                ep = f"https://{container_ip}:6443"
+                logger.info("EKS: %s endpoint resolved to %s (network %s)", name, ep, ms_network)
+                return ep
+        except Exception as e:
+            logger.debug("EKS: %s container-IP endpoint lookup failed: %s", name, e)
+    # Readiness is probed on 127.0.0.1 (the published port is local to the ministack
+    # process); the returned host is MINISTACK_HOST so external clients get a
+    # reachable address, consistent with the OIDC issuer URL (_issuer_url).
+    host_endpoint = f"https://{_MINISTACK_HOST}:{port}"
+    if not probe:
+        logger.info("EKS: %s endpoint set to %s (no probe)", name, host_endpoint)
+    elif port and _wait_for_port("127.0.0.1", port):
+        logger.info("EKS: %s endpoint resolved to %s", name, host_endpoint)
+    else:
+        logger.warning("EKS: %s k3s not reachable on port %s — using %s", name, port, host_endpoint)
+    return host_endpoint
 
 
 def _collect_oidc_state(cluster_name: str):
@@ -410,7 +473,7 @@ def _create_cluster(body):
 
     # Build cluster record immediately (status CREATING) and return fast.
     # k3s startup happens in background thread to avoid blocking the event loop.
-    endpoint = f"https://localhost:{port}"
+    endpoint = f"https://{_MINISTACK_HOST}:{port}"
     cluster = {
         "name": name,
         "arn": arn,
@@ -458,38 +521,26 @@ def _create_cluster(body):
             cluster["status"] = "ACTIVE"
             logger.info("EKS: Docker unavailable — cluster %s created without k3s backend", name)
             return
+        ms_network = None
         try:
             ms_network = _get_ministack_network(client)
             run_kwargs = _k3s_run_kwargs(name=name, port=port, ms_network=ms_network, oidc_args=oidc_args, node_labels=node_labels)
 
-
             container = client.containers.run(**run_kwargs)
             cluster["_docker_id"] = container.id
 
-            ep = ""
-            if ms_network:
-                container.reload()
-                networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-                container_ip = networks.get(ms_network, {}).get("IPAddress", "")
-                if container_ip and _wait_for_port(container_ip, 6443):
-                    ep = f"https://{container_ip}:6443"
-                    logger.info("EKS: k3s for %s ready at %s (network %s)", name, ep, ms_network)
-            if not ep:
-                if _wait_for_port("127.0.0.1", port):
-                    ep = f"https://localhost:{port}"
-                    logger.info("EKS: k3s for %s ready at %s", name, ep)
-                else:
-                    logger.warning("EKS: k3s for %s did not become ready on port %d", name, port)
-                    ep = f"https://localhost:{port}"
-
-            cluster["endpoint"] = ep
+            cluster["endpoint"] = _resolve_cluster_endpoint(client, cluster, ms_network)
             cluster["certificateAuthority"]["data"] = _extract_ca_cert(container)
             cluster["status"] = "ACTIVE"
         except Exception as e:
             logger.warning("EKS: failed to start k3s for %s — falling back to mock: %s", name, e)
             cluster["status"] = "ACTIVE"
             cluster["certificateAuthority"]["data"] = base64.b64encode(b"MOCK-CA-CERTIFICATE").decode()
-            cluster["endpoint"] = f"https://localhost:{port}"
+            # Failure path: the container did not start, so skip the readiness probe
+            # (it would block this thread on a port that will never open) and return
+            # the best-effort endpoint immediately — container IP if one exists, else
+            # localhost.
+            cluster["endpoint"] = _resolve_cluster_endpoint(client, cluster, ms_network, probe=False)
 
     threading.Thread(target=_bg_start, daemon=True, name=f"eks-{name}").start()
     return _json_resp(200, {"cluster": _sanitize(cluster)})
@@ -953,7 +1004,7 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
             cfg["status"] = "ACTIVE"
 
     def _bg_restart():
-        port = cluster["_port"]
+        ms_network = None
         try:
             docker_id = cluster.get("_docker_id")
             if docker_id:
@@ -966,34 +1017,20 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
                 cluster["_docker_id"] = None
 
             ms_network = _get_ministack_network(client)
-            run_kwargs = _k3s_run_kwargs(name=cluster_name, port=port, ms_network=ms_network, oidc_args=oidc_args, node_labels=node_labels)
+            run_kwargs = _k3s_run_kwargs(name=cluster_name, port=cluster["_port"], ms_network=ms_network, oidc_args=oidc_args, node_labels=node_labels)
 
             container = client.containers.run(**run_kwargs)
             cluster["_docker_id"] = container.id
 
-            ep = ""
-            if ms_network:
-                container.reload()
-                networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-                container_ip = networks.get(ms_network, {}).get("IPAddress", "")
-                if container_ip and _wait_for_port(container_ip, 6443):
-                    ep = f"https://{container_ip}:6443"
-                    logger.info("EKS: k3s for %s restarted and ready at %s (network %s)", cluster_name, ep, ms_network)
-            if not ep:
-                if _wait_for_port("127.0.0.1", port):
-                    ep = f"https://localhost:{port}"
-                    logger.info("EKS: k3s for %s restarted and ready at %s", cluster_name, ep)
-                else:
-                    logger.warning("EKS: k3s for %s restarted but did not become ready on port %d", cluster_name, port)
-                    ep = f"https://localhost:{port}"
-
-            cluster["endpoint"] = ep
+            cluster["endpoint"] = _resolve_cluster_endpoint(client, cluster, ms_network)
             cluster["certificateAuthority"]["data"] = _extract_ca_cert(container)
             _mark_idp_active()
         except Exception as e:
             logger.warning("EKS: failed to restart k3s for %s — falling back to mock: %s", cluster_name, e)
             cluster["certificateAuthority"]["data"] = base64.b64encode(b"MOCK-CA-CERTIFICATE").decode()
-            cluster["endpoint"] = f"https://localhost:{port}"
+            # Failure path: skip the readiness probe (see _bg_start) to avoid blocking
+            # this thread on a port the failed container will never open.
+            cluster["endpoint"] = _resolve_cluster_endpoint(client, cluster, ms_network, probe=False)
             _mark_idp_active()
 
     threading.Thread(target=_bg_restart, daemon=True, name=f"eks-restart-{cluster_name}").start()
