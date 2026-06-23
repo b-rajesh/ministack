@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **EKS — IMDS endpoint injected into k3s containers so in-cluster AWS SDKs work without the metadata workaround** — the EC2 IMDS link-local address (`169.254.169.254`) is not reachable from inside the nested k3s container (the route is hypervisor-provided on real EC2 and absent in plain Docker networking), so in-cluster controllers such as Karpenter, the AWS Load Balancer Controller, and the EBS CSI driver hung on IMDS and required `AWS_EC2_METADATA_DISABLED=true` + dummy credentials. The k3s container now receives `AWS_EC2_METADATA_SERVICE_ENDPOINT=http://<ministack-host>:<gateway-port>` (and `AWS_REGION` for the cluster's region), pointing those SDKs at MiniStack's IMDS handler on the gateway. `<ministack-host>` is MiniStack's container IP when k3s shares its Docker network, otherwise `host.docker.internal` (now also resolvable on plain Linux Docker via a `host-gateway` mapping). The iptables/DNAT path for SDKs that ignore `AWS_EC2_METADATA_SERVICE_ENDPOINT` is intentionally not implemented — the env var is honoured by AWS SDK for Go v1.27+/v2, boto3, and AWS SDK for Java v2. Contributed by @b-rajesh.
+
+---
+
 ## [1.3.66] — 2026-06-22
 
 ### Added

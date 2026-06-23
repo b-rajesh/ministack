@@ -248,6 +248,37 @@ def _get_ministack_network(client):
         return None
 
 
+def _resolve_ministack_host(client, ms_network):
+    """Address k3s containers use to reach the MiniStack gateway (for IMDS).
+
+    In-cluster AWS SDKs (Karpenter, ALB controller, EBS CSI driver) cannot reach
+    the EC2 IMDS link-local address (169.254.169.254) from inside a Docker
+    container, so they are pointed at the gateway via
+    AWS_EC2_METADATA_SERVICE_ENDPOINT instead. This returns the gateway address
+    as seen from inside the k3s container:
+
+    - on a shared Docker network: MiniStack's own container IP on that network
+    - otherwise: ``host.docker.internal`` (provided by Docker Desktop, and on
+      plain Linux via the ``extra_hosts`` host-gateway mapping in
+      ``_k3s_run_kwargs``)
+
+    Docker-based and contextvar-free — safe to call from the background
+    start/restart threads (the caller resolves ``client`` and ``ms_network``).
+    """
+    if ms_network:
+        try:
+            hostname = os.environ.get("HOSTNAME", "")
+            if hostname:
+                self_container = client.containers.get(hostname)
+                networks = self_container.attrs.get("NetworkSettings", {}).get("Networks", {})
+                ip = networks.get(ms_network, {}).get("IPAddress", "")
+                if ip:
+                    return ip
+        except Exception as e:
+            logger.debug("EKS: MiniStack self-IP lookup on network %s failed: %s", ms_network, e)
+    return "host.docker.internal"
+
+
 def _wait_for_port(host, port, timeout=30):
     import socket
     deadline = time.time() + timeout
@@ -305,7 +336,7 @@ def _collect_node_labels(cluster: dict) -> list[str]:
     return [f"--node-label={k}={v}" for k, v in labels.items()]
 
 
-def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None, oidc_args: list[str] | None = None, node_labels: list[str] | None = None) -> dict:
+def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None, oidc_args: list[str] | None = None, node_labels: list[str] | None = None, region: str | None = None, ministack_host: str | None = None) -> dict:
     """Build the docker run kwargs for a k3s server container.
 
     `privileged=True` is required: k3s server mode remounts `/sys/fs/cgroup`,
@@ -326,6 +357,16 @@ def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None, oidc_ar
     if node_labels:
         command.extend(node_labels)
 
+    environment = {"K3S_KUBECONFIG_MODE": "644"}
+    # Point in-cluster AWS SDKs at the MiniStack gateway for IMDS — the EC2
+    # link-local 169.254.169.254 is unreachable from inside a Docker container —
+    # and pin the cluster's region. Both are standard AWS SDK env vars.
+    if ministack_host:
+        gateway_port = os.environ.get("GATEWAY_PORT", "4566")
+        environment["AWS_EC2_METADATA_SERVICE_ENDPOINT"] = f"http://{ministack_host}:{gateway_port}"
+    if region:
+        environment["AWS_REGION"] = region
+
     run_kwargs = dict(
         image=apply_image_prefix(EKS_K3S_IMAGE),
         command=command,
@@ -344,7 +385,8 @@ def _k3s_run_kwargs(name: str, port: int, ms_network: str | None = None, oidc_ar
         ports={"6443/tcp": port},
         name=f"ministack-eks-{name}",
         labels={"ministack": "eks", "cluster_name": name},
-        environment={"K3S_KUBECONFIG_MODE": "644"},
+        environment=environment,
+        extra_hosts={"host.docker.internal": "host-gateway"},
         volumes={"/lib/modules": {"bind": "/lib/modules", "mode": "ro"}},
         tmpfs={"/run": "", "/var/run": "", "/tmp": ""},
     )
@@ -451,6 +493,7 @@ def _create_cluster(body):
 
     oidc_args, _idp_cfg_refs = _collect_oidc_state(name)
     node_labels = _collect_node_labels(cluster)
+    region = get_region()  # request context; the bg thread has no contextvars
 
     def _bg_start():
         client = _get_docker()
@@ -460,7 +503,8 @@ def _create_cluster(body):
             return
         try:
             ms_network = _get_ministack_network(client)
-            run_kwargs = _k3s_run_kwargs(name=name, port=port, ms_network=ms_network, oidc_args=oidc_args, node_labels=node_labels)
+            ministack_host = _resolve_ministack_host(client, ms_network)
+            run_kwargs = _k3s_run_kwargs(name=name, port=port, ms_network=ms_network, oidc_args=oidc_args, node_labels=node_labels, region=region, ministack_host=ministack_host)
 
 
             container = client.containers.run(**run_kwargs)
@@ -947,6 +991,7 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
     oidc_args = oidc_args or []
     idp_cfg_refs = idp_cfg_refs or []
     node_labels = _collect_node_labels(cluster)
+    region = get_region()  # request context; the bg thread has no contextvars
 
     def _mark_idp_active():
         for cfg in idp_cfg_refs:
@@ -966,7 +1011,8 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
                 cluster["_docker_id"] = None
 
             ms_network = _get_ministack_network(client)
-            run_kwargs = _k3s_run_kwargs(name=cluster_name, port=port, ms_network=ms_network, oidc_args=oidc_args, node_labels=node_labels)
+            ministack_host = _resolve_ministack_host(client, ms_network)
+            run_kwargs = _k3s_run_kwargs(name=cluster_name, port=port, ms_network=ms_network, oidc_args=oidc_args, node_labels=node_labels, region=region, ministack_host=ministack_host)
 
             container = client.containers.run(**run_kwargs)
             cluster["_docker_id"] = container.id

@@ -872,3 +872,71 @@ def test_eks_k3s_run_kwargs_appends_node_labels():
     # Existing server flags must still be present — refactor must not regress them.
     assert "server" in run_kwargs["command"]
     assert "--https-listen-port=6443" in run_kwargs["command"]
+
+
+# ---------------------------------------------------------------------------
+# IMDS endpoint injection (in-cluster AWS SDKs reach the MiniStack gateway)
+# ---------------------------------------------------------------------------
+
+class _FakeSelfContainer:
+    def __init__(self, ip, network):
+        self.attrs = {"NetworkSettings": {"Networks": {network: {"IPAddress": ip}}}}
+
+
+class _FakeClientByName:
+    def __init__(self, self_container):
+        self._self = self_container
+
+    class _Containers:
+        def __init__(self, self_container):
+            self._self = self_container
+
+        def get(self, _name):
+            return self._self
+
+    @property
+    def containers(self):
+        return self._Containers(self._self)
+
+
+def test_eks_k3s_run_kwargs_injects_aws_metadata_env(monkeypatch):
+    """region + ministack_host produce the IMDS-redirect env so in-cluster AWS SDKs
+    hit the MiniStack gateway instead of the unreachable 169.254.169.254."""
+    from ministack.services.eks import _k3s_run_kwargs
+
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    kw = _k3s_run_kwargs(name="t", port=16443, region="us-west-2", ministack_host="10.0.0.5")
+    env = kw["environment"]
+    assert env["AWS_EC2_METADATA_SERVICE_ENDPOINT"] == "http://10.0.0.5:4566"
+    assert env["AWS_REGION"] == "us-west-2"
+    assert env["K3S_KUBECONFIG_MODE"] == "644"  # existing env must be preserved
+    # host.docker.internal must resolve on plain Linux Docker too.
+    assert kw["extra_hosts"] == {"host.docker.internal": "host-gateway"}
+
+
+def test_eks_k3s_run_kwargs_omits_aws_env_when_unresolved():
+    """Without region/ministack_host (e.g. Docker unavailable) no AWS_* env is set —
+    back-compat with callers that do not pass them."""
+    from ministack.services.eks import _k3s_run_kwargs
+
+    env = _k3s_run_kwargs(name="t", port=16443)["environment"]
+    assert "AWS_EC2_METADATA_SERVICE_ENDPOINT" not in env
+    assert "AWS_REGION" not in env
+    assert env["K3S_KUBECONFIG_MODE"] == "644"
+
+
+def test_eks_resolve_ministack_host_uses_container_ip(monkeypatch):
+    """On a shared Docker network, k3s must reach MiniStack at its own container IP
+    on that network (so IMDS is reachable from inside the cluster)."""
+    from ministack.services import eks as eks_mod
+
+    monkeypatch.setenv("HOSTNAME", "ministack-abc123")
+    client = _FakeClientByName(_FakeSelfContainer("172.20.0.4", "shared-net"))
+    assert eks_mod._resolve_ministack_host(client, "shared-net") == "172.20.0.4"
+
+
+def test_eks_resolve_ministack_host_falls_back_to_host_docker_internal():
+    """No shared network → host.docker.internal (Docker Desktop / host-gateway)."""
+    from ministack.services import eks as eks_mod
+
+    assert eks_mod._resolve_ministack_host(client=None, ms_network=None) == "host.docker.internal"
