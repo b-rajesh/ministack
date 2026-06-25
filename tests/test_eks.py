@@ -875,24 +875,11 @@ def test_eks_k3s_run_kwargs_appends_node_labels():
 
 
 # ---------------------------------------------------------------------------
-# DescribeCluster endpoint (host-published port by default; container-ip opt-in)
+# DescribeCluster endpoint (host-published port)
 # ---------------------------------------------------------------------------
 
-class _FakeContainer:
-    def __init__(self, ip, network):
-        self._ip = ip
-        self._network = network
-
-    def reload(self):
-        pass
-
-    @property
-    def attrs(self):
-        return {"NetworkSettings": {"Networks": {self._network: {"IPAddress": self._ip}}}}
-
-
 def test_eks_cluster_endpoint_defaults_to_host_form():
-    """Default mode advertises the host-published port — reachable from the host
+    """Advertises the host-published port — reachable from the host
     (aws eks update-kubeconfig + kubectl), not a docker-internal IP."""
     from ministack.services import eks as eks_mod
 
@@ -905,34 +892,6 @@ def test_eks_cluster_endpoint_honours_ministack_host(monkeypatch):
 
     monkeypatch.setattr(eks_mod, "_MINISTACK_HOST", "10.0.0.5")
     assert eks_mod._cluster_endpoint(16443) == "https://10.0.0.5:16443"
-
-
-def test_eks_cluster_endpoint_host_mode_ignores_container(monkeypatch):
-    """In the default host mode a running container must NOT change the endpoint —
-    DescribeCluster never advertises a host-unroutable container IP."""
-    from ministack.services import eks as eks_mod
-
-    monkeypatch.setattr(eks_mod, "_EKS_ENDPOINT_MODE", "host")
-    ep = eks_mod._cluster_endpoint(16443, _FakeContainer("172.18.0.7", "ministack-net"), "ministack-net")
-    assert ep == "https://localhost:16443"
-
-
-def test_eks_cluster_endpoint_container_ip_opt_in(monkeypatch):
-    """MINISTACK_EKS_ENDPOINT_MODE=container-ip advertises the container's network IP
-    on :6443 — for same-network container-only consumers."""
-    from ministack.services import eks as eks_mod
-
-    monkeypatch.setattr(eks_mod, "_EKS_ENDPOINT_MODE", "container-ip")
-    ep = eks_mod._cluster_endpoint(16443, _FakeContainer("172.18.0.7", "ministack-net"), "ministack-net")
-    assert ep == "https://172.18.0.7:6443"
-
-
-def test_eks_cluster_endpoint_container_ip_mode_falls_back_to_host(monkeypatch):
-    """container-ip mode with no container/IP available → host form (never empty)."""
-    from ministack.services import eks as eks_mod
-
-    monkeypatch.setattr(eks_mod, "_EKS_ENDPOINT_MODE", "container-ip")
-    assert eks_mod._cluster_endpoint(16443) == "https://localhost:16443"
 
 
 def test_eks_restore_state_normalizes_endpoint_to_localhost():

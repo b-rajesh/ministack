@@ -37,12 +37,6 @@ logger = logging.getLogger("eks")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
-# DescribeCluster endpoint mode. "host" (default) advertises the host-published
-# port (https://{MINISTACK_HOST}:{port}) — reachable from the host and from
-# containers that can route to MINISTACK_HOST. "container-ip" advertises the k3s
-# container's IP on the ministack Docker network — opt-in, for same-network
-# container-only consumers; that address is not routable from the host.
-_EKS_ENDPOINT_MODE = os.environ.get("MINISTACK_EKS_ENDPOINT_MODE", "host")
 EKS_K3S_IMAGE = os.environ.get("EKS_K3S_IMAGE", "rancher/k3s:v1.31.4-k3s1")
 EKS_BASE_PORT = int(os.environ.get("EKS_BASE_PORT", "16443"))
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
@@ -262,34 +256,14 @@ def _get_ministack_network(client):
         return None
 
 
-def _cluster_endpoint(port, container=None, ms_network=None):
-    """The endpoint DescribeCluster advertises for the kube-apiserver.
-
-    Default (``MINISTACK_EKS_ENDPOINT_MODE=host``): the host-published port,
-    ``https://{MINISTACK_HOST}:{port}``. The k3s container publishes 6443 to this
-    host port (``ports={"6443/tcp": port}``), so it is reachable from the host
-    (``aws eks update-kubeconfig`` + kubectl) and from containers that can route to
-    ``MINISTACK_HOST``. The same form is used on every path (create, restart,
-    restore).
-
-    Opt-in (``MINISTACK_EKS_ENDPOINT_MODE=container-ip``): advertise the k3s
-    container's IP on the ministack Docker network, ``https://{ip}:6443`` — for
-    deployments whose only consumers are sibling containers on that network. That
-    address is not routable from the host, so it is off by default.
-
-    ``container`` / ``ms_network`` are only consulted in container-ip mode; the
-    caller passes them from the thread that started the container (no contextvar
-    reads here).
+def _cluster_endpoint(port):
+    """The endpoint DescribeCluster advertises for the kube-apiserver — the
+    host-published port ``https://{MINISTACK_HOST}:{port}``. The k3s container
+    publishes 6443 to this host port (``ports={"6443/tcp": port}``), so it is
+    reachable from the host (``aws eks update-kubeconfig`` + kubectl) and from
+    containers that can route to ``MINISTACK_HOST``. The same value is used on
+    every path (create, restart, restore).
     """
-    if _EKS_ENDPOINT_MODE == "container-ip" and container is not None and ms_network:
-        try:
-            container.reload()
-            networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-            ip = networks.get(ms_network, {}).get("IPAddress", "")
-            if ip:
-                return f"https://{ip}:6443"
-        except Exception as e:
-            logger.debug("EKS: container-ip endpoint lookup failed: %s", e)
     return f"https://{_MINISTACK_HOST}:{port}"
 
 
@@ -499,7 +473,7 @@ def _create_cluster(body):
             container = client.containers.run(**run_kwargs)
             cluster["_docker_id"] = container.id
 
-            cluster["endpoint"] = _cluster_endpoint(port, container, ms_network)
+            cluster["endpoint"] = _cluster_endpoint(port)
             cluster["certificateAuthority"]["data"] = _extract_ca_cert(container)
             cluster["status"] = "ACTIVE"
         except Exception as e:
@@ -989,7 +963,7 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
             container = client.containers.run(**run_kwargs)
             cluster["_docker_id"] = container.id
 
-            cluster["endpoint"] = _cluster_endpoint(cluster["_port"], container, ms_network)
+            cluster["endpoint"] = _cluster_endpoint(cluster["_port"])
             cluster["certificateAuthority"]["data"] = _extract_ca_cert(container)
             _mark_idp_active()
         except Exception as e:
