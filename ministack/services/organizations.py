@@ -158,6 +158,26 @@ def _list_accounts_for_parent(payload):
     return _json(200, {"Accounts": out, "NextToken": None})
 
 
+def _list_parents(payload):
+    _ensure_org()
+    child_id = payload.get("ChildId")
+    if not child_id:
+        return error_response_json("InvalidInputException", "ChildId is required", 400)
+    # A child is either an OU (ou-*) or an account; both store ``_ParentId``.
+    # AWS returns exactly one parent and does not surface it on Describe*, so the
+    # provider must ListParents the child to learn it (fires on create + refresh).
+    rec = _ous.get(child_id) or _accounts.get(child_id)
+    if rec is None:
+        return error_response_json(
+            "ChildNotFoundException",
+            f"We can't find an organizational unit (OU) or account with the ChildId {child_id}",
+            400,
+        )
+    parent_id = rec.get("_ParentId")
+    parent_type = "ROOT" if str(parent_id).startswith("r-") else "ORGANIZATIONAL_UNIT"
+    return _json(200, {"Parents": [{"Id": parent_id, "Type": parent_type}], "NextToken": None})
+
+
 def _create_organizational_unit(payload):
     _ensure_org()
     parent_id = payload.get("ParentId")
@@ -208,6 +228,7 @@ _DISPATCH = {
     "DescribeAccount": _describe_account,
     "ListOrganizationalUnitsForParent": _list_organizational_units_for_parent,
     "ListAccountsForParent": _list_accounts_for_parent,
+    "ListParents": _list_parents,
     "CreateOrganizationalUnit": _create_organizational_unit,
     "DescribeOrganizationalUnit": _describe_organizational_unit,
     "DeleteOrganizationalUnit": _delete_organizational_unit,

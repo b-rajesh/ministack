@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Organizations — `ListParents` (OU/account parent read-back)** — `ListParents(ChildId)` returns the single parent AWS reports (`{"Parents": [{"Id", "Type"}]}`, `Type=ROOT` when the parent is the org root, otherwise `ORGANIZATIONAL_UNIT`), reading the `_ParentId` MiniStack already stores on every OU and account — no new state. An unknown `ChildId` returns `ChildNotFoundException`. The Terraform/OpenTofu `aws_organizations_organizational_unit` Read calls `ListParents` to populate `parent_id` (real-AWS `DescribeOrganizationalUnit` omits the parent, so the provider must look it up, and SDKv2 fires it on every create and refresh); without it a multi-OU `apply` errored on the read-back (`InvalidAction: Operation 'ListParents' not implemented`), so nested OUs were never created and the apply was never idempotent. Closes #990.
+
 ## [1.3.68] — 2026-06-25
 
 ### Fixed

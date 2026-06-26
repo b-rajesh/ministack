@@ -81,3 +81,50 @@ def test_organizations_list_ous_for_parent():
         assert any(x["Id"] == ou["Id"] for x in listed)
     finally:
         o.delete_organizational_unit(OrganizationalUnitId=ou["Id"])
+
+
+def test_organizations_list_parents_ou_under_root():
+    """Terraform Read path: ListParents on a top-level OU returns the ROOT parent."""
+    o = _client_for("555555555555")
+    root_id = o.list_roots()["Roots"][0]["Id"]
+    ou = o.create_organizational_unit(ParentId=root_id, Name="Platform")["OrganizationalUnit"]
+    try:
+        parents = o.list_parents(ChildId=ou["Id"])["Parents"]
+        assert len(parents) == 1
+        assert parents[0]["Id"] == root_id
+        assert parents[0]["Type"] == "ROOT"
+    finally:
+        o.delete_organizational_unit(OrganizationalUnitId=ou["Id"])
+
+
+def test_organizations_list_parents_nested_ou():
+    """A nested OU reports its parent OU with Type ORGANIZATIONAL_UNIT."""
+    o = _client_for("666666666666")
+    root_id = o.list_roots()["Roots"][0]["Id"]
+    parent = o.create_organizational_unit(ParentId=root_id, Name="Workloads")["OrganizationalUnit"]
+    child = o.create_organizational_unit(ParentId=parent["Id"], Name="Prod")["OrganizationalUnit"]
+    try:
+        parents = o.list_parents(ChildId=child["Id"])["Parents"]
+        assert len(parents) == 1
+        assert parents[0]["Id"] == parent["Id"]
+        assert parents[0]["Type"] == "ORGANIZATIONAL_UNIT"
+    finally:
+        o.delete_organizational_unit(OrganizationalUnitId=child["Id"])
+        o.delete_organizational_unit(OrganizationalUnitId=parent["Id"])
+
+
+def test_organizations_list_parents_account():
+    """ListParents resolves an account's parent (master account sits under root)."""
+    o = _client_for("777777777777")
+    root_id = o.list_roots()["Roots"][0]["Id"]
+    parents = o.list_parents(ChildId="777777777777")["Parents"]
+    assert len(parents) == 1
+    assert parents[0]["Id"] == root_id
+    assert parents[0]["Type"] == "ROOT"
+
+
+def test_organizations_list_parents_unknown_child():
+    o = _client_for("888888888888")
+    with pytest.raises(ClientError) as exc:
+        o.list_parents(ChildId="ou-xxxx-doesnotexist")
+    assert exc.value.response["Error"]["Code"] == "ChildNotFoundException"
