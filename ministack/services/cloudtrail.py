@@ -92,6 +92,15 @@ def _trail_arn(name: str) -> str:
     return f"arn:aws:cloudtrail:{get_region()}:{get_account_id()}:trail/{name}"
 
 
+def _normalize_kms_key_id(value: str) -> str:
+    """Echo the CMK as real AWS does — a full key ARN. A bare key id is expanded to
+    its ARN; an ARN or an ``alias/...`` reference is kept as sent (resolving an alias
+    to its target key ARN would need a KMS lookup we don't do). Returns "" when unset."""
+    if not value or value.startswith("arn:") or value.startswith("alias/"):
+        return value
+    return f"arn:aws:kms:{get_region()}:{get_account_id()}:key/{value}"
+
+
 def _get_event_queue() -> collections.deque:
     q = _events.get("events")
     if q is None:
@@ -239,16 +248,22 @@ def _create_trail(body: dict):
         return _err("InvalidTrailNameException", "Trail name is required.")
     if _trails.get(name) is not None:
         return _err("TrailAlreadyExistsException", f"Trail {name!r} already exists.")
+    region, account = get_region(), get_account_id()
     arn = _trail_arn(name)
+    sns_name = body.get("SnsTopicName", "")
     trail = {
         "Name": name,
         "S3BucketName": body.get("S3BucketName", ""),
         "S3KeyPrefix": body.get("S3KeyPrefix", ""),
-        "SnsTopicName": body.get("SnsTopicName", ""),
+        "SnsTopicName": sns_name,
+        "SnsTopicARN": f"arn:aws:sns:{region}:{account}:{sns_name}" if sns_name else "",
         "IncludeGlobalServiceEvents": body.get("IncludeGlobalServiceEvents", True),
         "IsMultiRegionTrail": body.get("IsMultiRegionTrail", False),
         "LogFileValidationEnabled": body.get("EnableLogFileValidation", False),
-        "HomeRegion": get_region(),
+        "CloudWatchLogsLogGroupArn": body.get("CloudWatchLogsLogGroupArn", ""),
+        "CloudWatchLogsRoleArn": body.get("CloudWatchLogsRoleArn", ""),
+        "KmsKeyId": _normalize_kms_key_id(body.get("KmsKeyId", "")),
+        "HomeRegion": region,
         "TrailARN": arn,
         "HasCustomEventSelectors": False,
         "HasInsightSelectors": False,
@@ -261,10 +276,15 @@ def _create_trail(body: dict):
             "Name": name,
             "S3BucketName": trail["S3BucketName"],
             "S3KeyPrefix": trail["S3KeyPrefix"],
+            "SnsTopicName": trail["SnsTopicName"],
+            "SnsTopicARN": trail["SnsTopicARN"],
             "IncludeGlobalServiceEvents": trail["IncludeGlobalServiceEvents"],
             "IsMultiRegionTrail": trail["IsMultiRegionTrail"],
             "TrailARN": arn,
             "LogFileValidationEnabled": trail["LogFileValidationEnabled"],
+            "CloudWatchLogsLogGroupArn": trail["CloudWatchLogsLogGroupArn"],
+            "CloudWatchLogsRoleArn": trail["CloudWatchLogsRoleArn"],
+            "KmsKeyId": trail["KmsKeyId"],
             "IsOrganizationTrail": trail["IsOrganizationTrail"],
         }
     )
@@ -382,11 +402,15 @@ def _update_trail(body: dict):
         ("EnableLogFileValidation", "LogFileValidationEnabled"),
         ("CloudWatchLogsLogGroupArn", "CloudWatchLogsLogGroupArn"),
         ("CloudWatchLogsRoleArn", "CloudWatchLogsRoleArn"),
-        ("KmsKeyId", "KmsKeyId"),
         ("IsOrganizationTrail", "IsOrganizationTrail"),
     ):
         if src in body:
             trail[dst] = body[src]
+    if "SnsTopicName" in body:
+        sns = body["SnsTopicName"]
+        trail["SnsTopicARN"] = f"arn:aws:sns:{get_region()}:{get_account_id()}:{sns}" if sns else ""
+    if "KmsKeyId" in body:
+        trail["KmsKeyId"] = _normalize_kms_key_id(body["KmsKeyId"])
     return _ok(
         {
             "Name": name,

@@ -201,6 +201,95 @@ def test_update_trail_persists_fields(ct):
     assert desc["IsMultiRegionTrail"] is True
 
 
+def test_create_trail_persists_kms_key_id(ct):
+    """CreateTrail accepts and round-trips KmsKeyId, matching UpdateTrail and real
+    AWS. Without persisting it at create time, a CMK-encrypted trail reads back with
+    no KmsKeyId, so Terraform's aws_cloudtrail sees a perpetual diff on kms_key_id."""
+    name = f"trail-kms-{_uid()}"
+    kms_arn = f"arn:aws:kms:{REGION}:000000000000:key/{_uid()}"
+    resp = ct.create_trail(Name=name, S3BucketName="bucket", KmsKeyId=kms_arn)
+    assert resp["KmsKeyId"] == kms_arn
+    assert resp["SnsTopicARN"] == ""  # no SNS topic configured -> empty, no fabricated ARN
+
+    desc = ct.describe_trails(trailNameList=[name])["trailList"][0]
+    assert desc["KmsKeyId"] == kms_arn
+
+    got = ct.get_trail(Name=name)["Trail"]
+    assert got["KmsKeyId"] == kms_arn
+
+
+def test_create_trail_normalizes_bare_kms_key_id(ct):
+    """A bare KMS key id is returned as a full key ARN, matching real AWS, which
+    always echoes the CMK as an ARN — so a trail created with a key id shows no diff."""
+    name = f"trail-kmsid-{_uid()}"
+    key_id = f"{_uid()}-{_uid()}"
+    resp = ct.create_trail(Name=name, S3BucketName="bucket", KmsKeyId=key_id)
+    assert resp["KmsKeyId"] == f"arn:aws:kms:{REGION}:000000000000:key/{key_id}"
+    desc = ct.describe_trails(trailNameList=[name])["trailList"][0]
+    assert desc["KmsKeyId"] == resp["KmsKeyId"]
+
+
+def test_create_trail_persists_cloudwatch_and_sns_fields(ct):
+    """CreateTrail round-trips the CloudWatch Logs role/group and derives the SNS
+    topic ARN, so its create response and read-back match UpdateTrail and real AWS."""
+    name = f"trail-cw-{_uid()}"
+    log_group = f"arn:aws:logs:{REGION}:000000000000:log-group:ct-{_uid()}:*"
+    role = f"arn:aws:iam::000000000000:role/ct-{_uid()}"
+    topic = f"ct-topic-{_uid()}"
+    resp = ct.create_trail(
+        Name=name,
+        S3BucketName="bucket",
+        CloudWatchLogsLogGroupArn=log_group,
+        CloudWatchLogsRoleArn=role,
+        SnsTopicName=topic,
+    )
+    assert resp["CloudWatchLogsLogGroupArn"] == log_group
+    assert resp["CloudWatchLogsRoleArn"] == role
+    assert resp["SnsTopicName"] == topic
+    assert resp["SnsTopicARN"] == f"arn:aws:sns:{REGION}:000000000000:{topic}"
+    assert resp["KmsKeyId"] == ""  # no CMK on this trail -> empty
+
+    desc = ct.describe_trails(trailNameList=[name])["trailList"][0]
+    assert desc["CloudWatchLogsLogGroupArn"] == log_group
+    assert desc["CloudWatchLogsRoleArn"] == role
+    assert desc["SnsTopicARN"] == resp["SnsTopicARN"]
+
+
+def test_create_trail_keeps_kms_alias(ct):
+    """An ``alias/...`` reference is echoed verbatim — real AWS resolves it to the
+    target key ARN, but the emulator keeps the caller's value rather than fabricate a
+    wrong ARN (resolving the alias would need a KMS lookup it does not do)."""
+    name = f"trail-alias-{_uid()}"
+    alias = f"alias/ct-{_uid()}"
+    resp = ct.create_trail(Name=name, S3BucketName="bucket", KmsKeyId=alias)
+    assert resp["KmsKeyId"] == alias
+    assert ct.describe_trails(trailNameList=[name])["trailList"][0]["KmsKeyId"] == alias
+
+
+def test_update_trail_normalizes_kms_key_id(ct):
+    """UpdateTrail normalizes KmsKeyId the same way CreateTrail does: a bare key id
+    becomes a full key ARN; an already-full ARN is left as-is."""
+    name = f"trail-upkms-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    key_id = f"{_uid()}-{_uid()}"
+    out = ct.update_trail(Name=name, KmsKeyId=key_id)
+    assert out["KmsKeyId"] == f"arn:aws:kms:{REGION}:000000000000:key/{key_id}"
+    assert ct.describe_trails(trailNameList=[name])["trailList"][0]["KmsKeyId"] == out["KmsKeyId"]
+    full = f"arn:aws:kms:{REGION}:000000000000:key/{_uid()}"
+    assert ct.update_trail(Name=name, KmsKeyId=full)["KmsKeyId"] == full
+
+
+def test_update_trail_rederives_sns_topic_arn(ct):
+    """Changing SnsTopicName via UpdateTrail re-derives SnsTopicARN, so the read-back
+    stays consistent with CreateTrail."""
+    name = f"trail-upsns-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    topic = f"ct-topic-{_uid()}"
+    out = ct.update_trail(Name=name, SnsTopicName=topic)
+    assert out["SnsTopicARN"] == f"arn:aws:sns:{REGION}:000000000000:{topic}"
+    assert ct.describe_trails(trailNameList=[name])["trailList"][0]["SnsTopicARN"] == out["SnsTopicARN"]
+
+
 def test_start_logging_not_found(ct):
     with pytest.raises(ClientError) as exc:
         ct.start_logging(Name=f"nonexistent-{_uid()}")

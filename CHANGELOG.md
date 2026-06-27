@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CloudTrail — `CreateTrail` persists the encryption / logging / notification fields it accepts** — `CreateTrail` dropped `KmsKeyId`, `CloudWatchLogsLogGroupArn`, `CloudWatchLogsRoleArn`, and the derived `SnsTopicARN` at create time (only `UpdateTrail` stored some of them), so `DescribeTrails`/`GetTrail` read them back empty and Terraform's `aws_cloudtrail` showed a permanent diff (notably on `kms_key_id`), reconciled on every apply. `CreateTrail` now stores and returns the same field set as `UpdateTrail`, and `KmsKeyId` is normalized to a full key ARN as real AWS echoes it (a bare key id is expanded; an ARN or `alias/...` is kept). A CMK-encrypted trail with CloudWatch Logs delivery and an SNS topic now round-trips without drift. Contributed by @b-rajesh.
+
+---
+
 ## [1.3.68] — 2026-06-25
 
 ### Fixed
